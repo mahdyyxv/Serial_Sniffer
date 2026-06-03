@@ -6,13 +6,13 @@
  */
 #include "sdc.h"
 #include "fatfs_platform.h"
-#include <string.h>   /* memcpy */
+#include <string.h>
 
-/* ── tunables ───────────────────────────────────────────────────────────── */
-#define DETECT_DEBOUNCE_TICKS  10U    /* timer ticks before a card-detect edge is trusted */
-#define INIT_RETRY_TICKS       2000U  /* timer ticks between mount retries (~2.4 s)        */
+/* ── tunables ──────────────────────────────────────────────────────────── */
+#define DETECT_DEBOUNCE_TICKS  10U    /* timer ticks before card-detect edge is trusted */
+#define INIT_RETRY_TICKS       2000U  /* timer ticks between mount retries (~2 s)        */
 
-/* ── state machine ──────────────────────────────────────────────────────── */
+/* ── state machine ─────────────────────────────────────────────────────── */
 typedef enum {
     SDC_INIT = 0,
     SDC_READY,
@@ -24,23 +24,30 @@ typedef enum {
     SDC_ERROR_READING,
 } eSDCState;
 
-/* ── write queue ────────────────────────────────────────────────────────── */
+/* ── write queue ───────────────────────────────────────────────────────── */
 typedef struct {
-    uint8_t date[SDC_DATE_MAX_SIZE];
-    uint8_t dateLen;
-    uint8_t data[SDC_DATA_MAX_SIZE];
-    uint8_t dataLen;
+    uint8_t  date[SDC_DATE_MAX_SIZE];
+    uint8_t  dateLen;
+    uint8_t  data[SDC_DATA_MAX_SIZE];
+    uint16_t dataLen;                  /* uint16_t: holds 0–256 without truncation */
 } sSDCRecord;
 
 static sSDCRecord s_queue[SDC_WRITE_QUEUE_SIZE];
-static uint8_t    s_qHead      = 0U;   /* index of the oldest record (next to write) */
-static uint8_t    s_qTail      = 0U;   /* index of the next free slot                */
-static uint8_t    s_qCount     = 0U;   /* number of records currently in the queue   */
+static uint8_t    s_qHead      = 0U;
+static uint8_t    s_qTail      = 0U;
+static uint8_t    s_qCount     = 0U;
 static bool       s_writeError = false;
 
-/* ── read descriptor ────────────────────────────────────────────────────── */
+/* ── persistent log file handle ───────────────────────────────────────── */
+/* Kept open between writes and flushed with f_sync after each record.
+   Eliminates repeated FAT traversal and directory-entry updates that
+   would otherwise block the main loop for 10-50 ms per record.         */
+static FIL  s_log_fil;
+static bool s_log_open = false;
+
+/* ── read descriptor ───────────────────────────────────────────────────── */
 typedef struct {
-    uint8_t        filename[32];          /* null-terminated; passed to FATFS as char* */
+    uint8_t        filename[32];
     uint32_t       offset;
     bool           pending;
     uint8_t        chunk[SDC_READ_CHUNK_SIZE];
@@ -50,20 +57,20 @@ typedef struct {
 
 static sReadReq s_read = {0};
 
-/* ── module state ───────────────────────────────────────────────────────── */
+/* ── module state ──────────────────────────────────────────────────────── */
 static eSDCState s_state = SDC_INIT;
 
-/* card-detect — set inside timer tick, consumed inside engine */
+/* card-detect — set in timer tick, consumed in engine */
 static volatile bool     s_cardInserted = false;
 static volatile bool     s_cardRemoved  = false;
 static uint8_t           s_debounce     = 0U;
 static bool              s_lastDetected = false;
 
-/* retry timing (counts timer ticks) */
+/* retry timing */
 static volatile uint32_t s_timerTicks   = 0U;
 static uint32_t          s_retryAt      = 0U;
 
-/* ── private helpers ────────────────────────────────────────────────────── */
+/* ── private helpers ───────────────────────────────────────────────────── */
 
 static FRESULT prvMount(void)
 {
@@ -75,16 +82,31 @@ static void prvUnmount(void)
     f_mount(NULL, SDPath, 0);
 }
 
-static FRESULT prvOpenAppend(FIL *fp, const char *path)
+/* Open (or create) the log file for appending and keep the handle.    */
+static FRESULT prvOpenLog(void)
 {
-    FRESULT fr = f_open(fp, path, FA_WRITE | FA_OPEN_ALWAYS);
+    if (s_log_open) {
+        f_close(&s_log_fil);
+        s_log_open = false;
+    }
+    FRESULT fr = f_open(&s_log_fil, SDC_LOG_FILENAME, FA_WRITE | FA_OPEN_ALWAYS);
     if (fr == FR_OK) {
-        fr = f_lseek(fp, f_size(fp));
-        if (fr != FR_OK) {
-            f_close(fp);
+        fr = f_lseek(&s_log_fil, f_size(&s_log_fil));
+        if (fr == FR_OK) {
+            s_log_open = true;
+        } else {
+            f_close(&s_log_fil);
         }
     }
     return fr;
+}
+
+static void prvCloseLog(void)
+{
+    if (s_log_open) {
+        f_close(&s_log_fil);
+        s_log_open = false;
+    }
 }
 
 static void prvClearQueue(void)
@@ -94,74 +116,80 @@ static void prvClearQueue(void)
     s_qCount = 0U;
 }
 
-/* Write the oldest queued record to the log file then advance the head.
-   Uses f_write with explicit lengths — no format strings, no char* casts. */
+/* Write the oldest queued record using the already-open file handle,
+   then flush with f_sync.  Checks every f_write return value.        */
 static void prvDoWrite(void)
 {
     static const uint8_t SEP = (uint8_t)',';
     static const uint8_t NL  = (uint8_t)'\n';
-    FIL  fil;
-    UINT bw;
-    HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
-    if (prvOpenAppend(&fil, SDC_LOG_FILENAME) != FR_OK) {
+    FRESULT fr;
+    UINT    bw;
+
+    if (!s_log_open) {
         s_writeError = true;
         s_state      = SDC_ERROR_WRITING;
         return;
     }
 
-    f_write(&fil, s_queue[s_qHead].date, s_queue[s_qHead].dateLen, &bw);
-    f_write(&fil, &SEP, 1U, &bw);
-    f_write(&fil, s_queue[s_qHead].data, s_queue[s_qHead].dataLen, &bw);
-    f_write(&fil, &NL,  1U, &bw);
-    f_close(&fil);
+    fr = f_write(&s_log_fil,
+                 s_queue[s_qHead].date,
+                 s_queue[s_qHead].dateLen, &bw);
+    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dateLen) { goto write_err; }
 
-    s_qHead  = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
+    fr = f_write(&s_log_fil, &SEP, 1U, &bw);
+    if (fr != FR_OK || bw != 1U) { goto write_err; }
+
+    fr = f_write(&s_log_fil,
+                 s_queue[s_qHead].data,
+                 s_queue[s_qHead].dataLen, &bw);
+    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dataLen) { goto write_err; }
+
+    fr = f_write(&s_log_fil, &NL, 1U, &bw);
+    if (fr != FR_OK || bw != 1U) { goto write_err; }
+
+    /* Flush metadata and data to card without closing the handle */
+    f_sync(&s_log_fil);
+
+    s_qHead      = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
     s_qCount--;
-
     s_writeError = false;
     s_state      = SDC_READY;
-    HAL_GPIO_TogglePin(LED_2_GPIO_Port, LED_2_Pin);
+    HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
+    return;
+
+write_err:
+    prvCloseLog();
+    s_writeError = true;
+    s_state      = SDC_ERROR_WRITING;
 }
 
 static void prvDoRead(void)
 {
-    FIL    fil;
-    UINT   bytesRead = 0U;
+    FIL     fil;
+    UINT    bytesRead = 0U;
     FRESULT fr;
 
-    /* FATFS expects a null-terminated char* path; filename was null-terminated on copy */
     fr = f_open(&fil, (const char *)s_read.filename, FA_READ);
-    if (fr != FR_OK) {
-        s_read.status = SDC_READ_FAIL;
-        s_state       = SDC_ERROR_READING;
-        return;
-    }
+    if (fr != FR_OK) { s_read.status = SDC_READ_FAIL; s_state = SDC_ERROR_READING; return; }
 
     fr = f_lseek(&fil, s_read.offset);
     if (fr != FR_OK) {
         f_close(&fil);
-        s_read.status = SDC_READ_FAIL;
-        s_state       = SDC_ERROR_READING;
-        return;
+        s_read.status = SDC_READ_FAIL; s_state = SDC_ERROR_READING; return;
     }
 
     fr = f_read(&fil, s_read.chunk, SDC_READ_CHUNK_SIZE, &bytesRead);
     f_close(&fil);
 
-    if (fr != FR_OK) {
-        s_read.status = SDC_READ_FAIL;
-        s_state       = SDC_ERROR_READING;
-        return;
-    }
+    if (fr != FR_OK) { s_read.status = SDC_READ_FAIL; s_state = SDC_ERROR_READING; return; }
 
     s_read.size    = (uint16_t)bytesRead;
     s_read.pending = false;
-    /* fewer bytes than requested means we hit the end of the file */
     s_read.status  = (bytesRead < SDC_READ_CHUNK_SIZE) ? SDC_READ_EOF : SDC_READ_OK;
     s_state        = SDC_READY;
 }
 
-/* ── public API ─────────────────────────────────────────────────────────── */
+/* ── public API ────────────────────────────────────────────────────────── */
 
 void vSDC_TimerTick(void)
 {
@@ -174,11 +202,8 @@ void vSDC_TimerTick(void)
         if (s_debounce >= DETECT_DEBOUNCE_TICKS) {
             s_lastDetected = detected;
             s_debounce     = 0U;
-            if (detected) {
-                s_cardInserted = true;
-            } else {
-                s_cardRemoved  = true;
-            }
+            if (detected) { s_cardInserted = true; }
+            else          { s_cardRemoved  = true; }
         }
     } else {
         s_debounce = 0U;
@@ -190,19 +215,19 @@ bool bSDC_IsReady(void)
     return (s_state == SDC_READY);
 }
 
-bool bSDC_Write(const uint8_t *date, uint8_t dateLen,
-                const uint8_t *buf,  uint8_t bufLen)
+bool bSDC_Write(const uint8_t *date, uint8_t  dateLen,
+                const uint8_t *buf,  uint16_t bufLen)
 {
     if (s_qCount >= SDC_WRITE_QUEUE_SIZE) {
-        return false;   /* queue full — caller must retry later */
+        return false;
     }
 
-    /* clamp lengths to buffer maximums */
-    if (dateLen > (uint8_t)(SDC_DATE_MAX_SIZE - 1U)) {
-        dateLen = (uint8_t)(SDC_DATE_MAX_SIZE - 1U);
+    /* Clamp lengths to their respective buffer sizes */
+    if (dateLen > (uint8_t)SDC_DATE_MAX_SIZE) {
+        dateLen = (uint8_t)SDC_DATE_MAX_SIZE;
     }
-    if (bufLen > (uint8_t)(SDC_DATA_MAX_SIZE - 1U)) {
-        bufLen = (uint8_t)(SDC_DATA_MAX_SIZE - 1U);
+    if (bufLen > (uint16_t)SDC_DATA_MAX_SIZE) {
+        bufLen = (uint16_t)SDC_DATA_MAX_SIZE;
     }
 
     memcpy(s_queue[s_qTail].date, date, dateLen);
@@ -229,11 +254,8 @@ bool bSDC_HasWriteError(void)
 
 bool bSDC_Read(const uint8_t *filename, uint8_t filenameLen, uint32_t offset)
 {
-    if (s_state != SDC_READY || s_read.pending) {
-        return false;
-    }
+    if (s_state != SDC_READY || s_read.pending) { return false; }
 
-    /* clamp and copy; keep a null terminator for the FATFS f_open call */
     if (filenameLen > (uint8_t)(sizeof(s_read.filename) - 1U)) {
         filenameLen = (uint8_t)(sizeof(s_read.filename) - 1U);
     }
@@ -254,19 +276,18 @@ eSDCReadStatus eSDC_GetReadStatus(void)
 
 uint16_t u16SDC_GetReadData(uint8_t *out)
 {
-    if (out == NULL || s_read.size == 0U) {
-        return 0U;
-    }
+    if (out == NULL || s_read.size == 0U) { return 0U; }
     memcpy(out, s_read.chunk, s_read.size);
     return s_read.size;
 }
 
 void vSDC_Engine(void)
 {
-    /* card removal takes priority over every other state */
+    /* Card removal takes priority over every other state */
     if (s_cardRemoved && s_state != SDC_CARD_REMOVED) {
         s_cardRemoved  = false;
         s_cardInserted = false;
+        prvCloseLog();        /* flush and close before unmounting */
         prvClearQueue();
         s_read.pending = false;
         prvUnmount();
@@ -278,8 +299,15 @@ void vSDC_Engine(void)
     {
         case SDC_INIT:
             if (prvMount() == FR_OK) {
-                s_state = SDC_READY;
-                HAL_Delay(100);
+                /* Open the log file once; keep handle open for all writes.
+                   No HAL_Delay here — f_mount already waits for the card. */
+                if (prvOpenLog() == FR_OK) {
+                    s_state = SDC_READY;
+                } else {
+                    prvUnmount();
+                    s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
+                    s_state   = SDC_ERROR_INIT;
+                }
             } else {
                 s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
                 s_state   = SDC_ERROR_INIT;
@@ -314,11 +342,17 @@ void vSDC_Engine(void)
             break;
 
         case SDC_ERROR_WRITING:
-            /* one engine tick here lets the caller observe bSDC_HasWriteError(),
-               then the failed record is discarded and the queue continues */
+            /* Discard the failed record.
+               Try to reopen the log file; if that also fails, re-mount. */
             s_qHead  = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
             s_qCount--;
-            s_state  = SDC_READY;
+            if (prvOpenLog() == FR_OK) {
+                s_state = SDC_READY;
+            } else {
+                prvUnmount();
+                s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
+                s_state   = SDC_ERROR_INIT;
+            }
             break;
 
         case SDC_ERROR_READING:

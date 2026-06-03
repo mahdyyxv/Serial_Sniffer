@@ -260,4 +260,26 @@ void OTG_HS_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/* Forward declaration — defined in rs485_parser.c */
+void vRs485Parser_IdleDetected(void);
+
+/**
+ * @brief USART2 global interrupt handler.
+ *        Detects the UART IDLE condition (bus quiet after end of frame)
+ *        and forwards it to the RS485 parser for frame-boundary detection.
+ *        The standard HAL_UART_IRQHandler call below handles all other
+ *        UART events (framing errors, overrun, DMA half/complete, etc.).
+ */
+void USART2_IRQHandler(void)
+{
+    extern UART_HandleTypeDef huart2;
+
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE)) {
+        __HAL_UART_CLEAR_IDLEFLAG(&huart2);
+        vRs485Parser_IdleDetected();
+    }
+
+    HAL_UART_IRQHandler(&huart2);
+}
+
 /* USER CODE END 1 */
