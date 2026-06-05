@@ -84,7 +84,7 @@ static void prvClearQueue(void)
 }
 
 static void prvWriteError(FIL *fil, bool fil_open){
-    if (fil_open) { f_close(&fil); }
+    if (fil_open) { f_close(fil); }
     s_writeError = true;
     s_state      = SDC_ERROR_WRITING;
 }
@@ -103,38 +103,38 @@ static void prvDoWrite(void)
 
     fr = f_open(&fil, SDC_LOG_FILENAME, FA_WRITE | FA_OPEN_ALWAYS);
     if (fr != FR_OK) { 
-        prvWriteError(fil, fil_open);
+        prvWriteError(&fil, fil_open);
         return;
     }
     fil_open = true;
 
     fr = f_lseek(&fil, f_size(&fil));
     if (fr != FR_OK) { 
-        prvWriteError(fil, fil_open);
+        prvWriteError(&fil, fil_open);
         return;
     }
 
     fr = f_write(&fil, s_queue[s_qHead].date, s_queue[s_qHead].dateLen, &bw);
     if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dateLen) {
-        prvWriteError(fil, fil_open); 
+        prvWriteError(&fil, fil_open);
         return;
     }
 
     fr = f_write(&fil, &SEP, 1U, &bw);
     if (fr != FR_OK || bw != 1U) { 
-        prvWriteError(fil, fil_open); 
+        prvWriteError(&fil, fil_open);
         return; 
     }
 
     fr = f_write(&fil, s_queue[s_qHead].data, s_queue[s_qHead].dataLen, &bw);
     if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dataLen) { 
-        prvWriteError(fil, fil_open); 
+        prvWriteError(&fil, fil_open);
         return;
     }
 
     fr = f_write(&fil, &NL, 1U, &bw);
     if (fr != FR_OK || bw != 1U){ 
-        prvWriteError(fil, fil_open); 
+        prvWriteError(&fil, fil_open);
         return;
     }
 
@@ -143,7 +143,7 @@ static void prvDoWrite(void)
     fr = f_close(&fil);
     fil_open = false;
     if (fr != FR_OK){ 
-        prvWriteError(fil, fil_open); 
+        prvWriteError(&fil, fil_open);
         return;
     }
 
