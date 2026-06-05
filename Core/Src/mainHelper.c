@@ -22,11 +22,12 @@
 extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart2;
 extern DMA_HandleTypeDef hdma_usart2_rx;
+extern IWDG_HandleTypeDef hiwdg;
 
 static void vTimer2_Interrupt_Handler(void);
 static void vLogRs485Frame(void);
 
-bool TimerTrigged = false;
+volatile bool TimerTrigged = false;
 
 /* DMA receive buffer — shared with HAL_UART_MspInit and rs485_parser.c.
    Size must match DMA_BUF_SIZE in rs485_parser.c (= RS485_MAX_FRAME_SIZE). */
@@ -40,6 +41,9 @@ void vMainInitFunc(void){
 
 void vMainLoopFunc(void){
     while(1){
+        /* Refresh watchdog at the top of each loop iteration.
+           Reaching here means no operation has blocked for > 10 s. */
+        HAL_IWDG_Refresh(&hiwdg);
         MX_USB_HOST_Process();
         vTimer2_Interrupt_Handler();
         vSDC_Engine();

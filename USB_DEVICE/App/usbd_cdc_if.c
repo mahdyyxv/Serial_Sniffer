@@ -20,9 +20,9 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "usbd_cdc_if.h"
-#include "parse_usb.h"
-/* USER CODE BEGIN INCLUDE */
 
+/* USER CODE BEGIN INCLUDE */
+#include "parse_usb.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/

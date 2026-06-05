@@ -38,12 +38,6 @@ static uint8_t    s_qTail      = 0U;
 static uint8_t    s_qCount     = 0U;
 static bool       s_writeError = false;
 
-/* ── persistent log file handle ───────────────────────────────────────── */
-/* Kept open between writes and flushed with f_sync after each record.
-   Eliminates repeated FAT traversal and directory-entry updates that
-   would otherwise block the main loop for 10-50 ms per record.         */
-static FIL  s_log_fil;
-static bool s_log_open = false;
 
 /* ── read descriptor ───────────────────────────────────────────────────── */
 typedef struct {
@@ -82,33 +76,6 @@ static void prvUnmount(void)
     f_mount(NULL, SDPath, 0);
 }
 
-/* Open (or create) the log file for appending and keep the handle.    */
-static FRESULT prvOpenLog(void)
-{
-    if (s_log_open) {
-        f_close(&s_log_fil);
-        s_log_open = false;
-    }
-    FRESULT fr = f_open(&s_log_fil, SDC_LOG_FILENAME, FA_WRITE | FA_OPEN_ALWAYS);
-    if (fr == FR_OK) {
-        fr = f_lseek(&s_log_fil, f_size(&s_log_fil));
-        if (fr == FR_OK) {
-            s_log_open = true;
-        } else {
-            f_close(&s_log_fil);
-        }
-    }
-    return fr;
-}
-
-static void prvCloseLog(void)
-{
-    if (s_log_open) {
-        f_close(&s_log_fil);
-        s_log_open = false;
-    }
-}
-
 static void prvClearQueue(void)
 {
     s_qHead  = 0U;
@@ -116,51 +83,75 @@ static void prvClearQueue(void)
     s_qCount = 0U;
 }
 
-/* Write the oldest queued record using the already-open file handle,
-   then flush with f_sync.  Checks every f_write return value.        */
+static void prvWriteError(FIL *fil, bool fil_open){
+    if (fil_open) { f_close(&fil); }
+    s_writeError = true;
+    s_state      = SDC_ERROR_WRITING;
+}
+
+/* Open the log file, write one record, then close it.
+   Closing after every record commits the directory entry and FAT to the
+   card, so a power loss between writes can never corrupt the filesystem. */
 static void prvDoWrite(void)
 {
     static const uint8_t SEP = (uint8_t)',';
     static const uint8_t NL  = (uint8_t)'\n';
+    FIL     fil;
     FRESULT fr;
     UINT    bw;
+    bool    fil_open = false;
 
-    if (!s_log_open) {
-        s_writeError = true;
-        s_state      = SDC_ERROR_WRITING;
+    fr = f_open(&fil, SDC_LOG_FILENAME, FA_WRITE | FA_OPEN_ALWAYS);
+    if (fr != FR_OK) { 
+        prvWriteError(fil, fil_open);
+        return;
+    }
+    fil_open = true;
+
+    fr = f_lseek(&fil, f_size(&fil));
+    if (fr != FR_OK) { 
+        prvWriteError(fil, fil_open);
         return;
     }
 
-    fr = f_write(&s_log_fil,
-                 s_queue[s_qHead].date,
-                 s_queue[s_qHead].dateLen, &bw);
-    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dateLen) { goto write_err; }
+    fr = f_write(&fil, s_queue[s_qHead].date, s_queue[s_qHead].dateLen, &bw);
+    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dateLen) {
+        prvWriteError(fil, fil_open); 
+        return;
+    }
 
-    fr = f_write(&s_log_fil, &SEP, 1U, &bw);
-    if (fr != FR_OK || bw != 1U) { goto write_err; }
+    fr = f_write(&fil, &SEP, 1U, &bw);
+    if (fr != FR_OK || bw != 1U) { 
+        prvWriteError(fil, fil_open); 
+        return; 
+    }
 
-    fr = f_write(&s_log_fil,
-                 s_queue[s_qHead].data,
-                 s_queue[s_qHead].dataLen, &bw);
-    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dataLen) { goto write_err; }
+    fr = f_write(&fil, s_queue[s_qHead].data, s_queue[s_qHead].dataLen, &bw);
+    if (fr != FR_OK || bw != (UINT)s_queue[s_qHead].dataLen) { 
+        prvWriteError(fil, fil_open); 
+        return;
+    }
 
-    fr = f_write(&s_log_fil, &NL, 1U, &bw);
-    if (fr != FR_OK || bw != 1U) { goto write_err; }
+    fr = f_write(&fil, &NL, 1U, &bw);
+    if (fr != FR_OK || bw != 1U){ 
+        prvWriteError(fil, fil_open); 
+        return;
+    }
 
-    /* Flush metadata and data to card without closing the handle */
-    f_sync(&s_log_fil);
+    /* f_close flushes the write buffer and updates the directory entry.
+       Treat a close failure the same as a write failure. */
+    fr = f_close(&fil);
+    fil_open = false;
+    if (fr != FR_OK){ 
+        prvWriteError(fil, fil_open); 
+        return;
+    }
 
-    s_qHead      = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
+    s_qHead  = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
     s_qCount--;
     s_writeError = false;
     s_state      = SDC_READY;
     HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
-    return;
-
-write_err:
-    prvCloseLog();
-    s_writeError = true;
-    s_state      = SDC_ERROR_WRITING;
 }
 
 static void prvDoRead(void)
@@ -285,9 +276,10 @@ void vSDC_Engine(void)
 {
     /* Card removal takes priority over every other state */
     if (s_cardRemoved && s_state != SDC_CARD_REMOVED) {
-        s_cardRemoved  = false;
-        s_cardInserted = false;
-        prvCloseLog();        /* flush and close before unmounting */
+        s_cardRemoved = false;
+        /* Do NOT clear s_cardInserted here. A rapid remove-then-reinsert can
+           set both flags before the engine runs. Clearing it here would discard
+           the valid reinsert and leave the machine stuck in SDC_CARD_REMOVED. */
         prvClearQueue();
         s_read.pending = false;
         prvUnmount();
@@ -299,15 +291,7 @@ void vSDC_Engine(void)
     {
         case SDC_INIT:
             if (prvMount() == FR_OK) {
-                /* Open the log file once; keep handle open for all writes.
-                   No HAL_Delay here — f_mount already waits for the card. */
-                if (prvOpenLog() == FR_OK) {
-                    s_state = SDC_READY;
-                } else {
-                    prvUnmount();
-                    s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
-                    s_state   = SDC_ERROR_INIT;
-                }
+                s_state = SDC_READY;
             } else {
                 s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
                 s_state   = SDC_ERROR_INIT;
@@ -336,23 +320,22 @@ void vSDC_Engine(void)
             break;
 
         case SDC_ERROR_INIT:
-            if (s_timerTicks >= s_retryAt) {
+            /* Wrap-safe comparison: (a - b) < 0x80000000 is equivalent to a >= b
+               for uint32_t values that differ by less than 2^31 ticks. */
+            if ((s_timerTicks - s_retryAt) < 0x80000000UL) {
                 s_state = SDC_INIT;
             }
             break;
 
         case SDC_ERROR_WRITING:
-            /* Discard the failed record.
-               Try to reopen the log file; if that also fails, re-mount. */
+            /* Discard the failed record. Since the file is opened and closed
+               per write there is no stale handle. Unmount and remount so the
+               HAL and filesystem are fully reset before the next attempt. */
             s_qHead  = (uint8_t)((s_qHead + 1U) % SDC_WRITE_QUEUE_SIZE);
             s_qCount--;
-            if (prvOpenLog() == FR_OK) {
-                s_state = SDC_READY;
-            } else {
-                prvUnmount();
-                s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
-                s_state   = SDC_ERROR_INIT;
-            }
+            prvUnmount();
+            s_retryAt = s_timerTicks + INIT_RETRY_TICKS;
+            s_state   = SDC_ERROR_INIT;
             break;
 
         case SDC_ERROR_READING:
