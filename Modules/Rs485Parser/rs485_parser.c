@@ -732,7 +732,7 @@ static void prvReinitUart2(const sRs485Config *cfg)
     HAL_UART_DMAStop(&huart2);
     HAL_UART_DeInit(&huart2);   /* calls HAL_UART_MspDeInit → HAL_DMA_DeInit */
 
-    bool is_dmx = (cfg->protocol == PROTO_DMX512);
+    bool is_dmx = false /*(cfg->protocol == PROTO_DMX512)*/;
 
     uint32_t baud   = is_dmx ? 250000u : BAUD_TABLE[cfg->baud_rate];
     uint32_t parity = is_dmx ? UART_PARITY_NONE : PARITY_HAL[cfg->parity];
@@ -817,7 +817,7 @@ void vRs485Parser_RxByte(uint8_t byte)
         case PROTO_IEC101:       /* fall-through */
         case PROTO_IEC103:       handle_ft12(byte);    break;
         case PROTO_BACNET_MSTP:  handle_bacnet(byte);  break;
-        case PROTO_DMX512:       handle_dmx(byte);     break;
+        //case PROTO_DMX512:       handle_dmx(byte);     break;
         case PROTO_RAW:          handle_raw(byte);     break;
         default:                                       break;
     }
@@ -932,10 +932,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2) {
-        if ((s_protocol == PROTO_DMX512) &&
-            (huart->ErrorCode & HAL_UART_ERROR_FE)) {
-            s_dmx_break = true;
-        }
+        // if ((s_protocol == PROTO_DMX512) &&
+        //     (huart->ErrorCode & HAL_UART_ERROR_FE)) {
+        //     s_dmx_break = true;
+        // }
         /* DMA continues running after a UART error — no restart needed */
     }
 }

@@ -11,6 +11,21 @@
 #include "parse_usb.h"
 #include "rtc.h"
 #include "password.h"
+#include "config.h"
+
+
+
+/*
+ * Config payload layout (10 bytes):
+ *   [0] baud_rate   (eBaudRate enum)
+ *   [1] stop_bits   (eStopBits enum)
+ *   [2] parity      (eParity enum)
+ *   [3] protocol    (eRs485Protocol enum)
+ *   [4] log_dir     (eLogDirection enum)
+ *   [5..9] params.bytes[0..4]
+ */
+#define CFG_PAYLOAD_SIZE (10u)
+
 /********************************* User Defined Types *********************************/
 typedef enum{
 	IDLE = 0,
@@ -20,11 +35,13 @@ typedef enum{
 }eUsbState;
 
 typedef enum{
-	NO_REQUEST = 48,   /* 48 = ASCII '0'; request codes are sent as ASCII digit characters over USB CDC */
+	NO_REQUEST = 0,
 	GET_DATE_TIME,
 	SET_DATE_TIME,
 	GET_PASSWORD,
 	SET_PASSWORD,
+	GET_CONFIG,
+	SET_CONFIG,
 	NO_OF_REQUESTS,
 }eRequests;
 
@@ -37,15 +54,19 @@ static bool ProcessGetDateTime(void);
 static bool ProcessSetDateTime(void);
 static bool ProcessGetPassword(void);
 static bool ProcessSetPassword(void);
+static bool ProcessGetConfig(void);
+static bool ProcessSetConfig(void);
 static uint8_t Checksum8_XOR(const uint8_t *data, size_t len);
 static bool VerifyChecksum(const uint8_t *frame, size_t len);
 /********************************* Variables Definitions *********************************/
-const static sRequestsHandlers RquestsFunctions[NO_OF_REQUESTS-NO_REQUEST] = {NULL,
+const static sRequestsHandlers RquestsFunctions[NO_OF_REQUESTS] = {
+		NULL,
 		ProcessGetDateTime,
 		ProcessSetDateTime,
 		ProcessGetPassword,
 		ProcessSetPassword,
-		NULL
+		ProcessGetConfig,
+		ProcessSetConfig,
 };
 
 static 			uint8_t 	*ptrFrameDataStart 	          = NULL;
@@ -75,7 +96,7 @@ static bool bParse(){
 			}
 		}
 		if(correct){
-			request 		= framePtr[i++]-NO_REQUEST;  /* post-increment: i advances past the request byte, leaving i at payload start */
+			request 		= framePtr[i++];  /* post-increment: i advances past the request byte, leaving i at payload start */
 			ptrFrameDataStart 	= &framePtr[i];
 		}
 	}
@@ -92,11 +113,8 @@ static bool bParse(){
  */
 static bool bUsbResponce(void){
 	bool returnVal = false;
-	uint32_t Arg1 = 0, Arg2 = 0;
-	if(RquestsFunctions[request] != NULL){  /* -48 converts ASCII digit to 0-based table index */
+	if((request < NO_OF_REQUESTS) && (RquestsFunctions[request] != NULL)){
 		returnVal = RquestsFunctions[request]();
-	}else{
-		returnVal = false;
 	}
 	return returnVal;
 }
@@ -198,6 +216,43 @@ static bool ProcessSetPassword(void){
 	memcpy(u8TxFrame, "ok", 2);
 	CDC_Transmit_FS(u8TxFrame, 2);
 
+	return true;
+}
+
+
+static bool ProcessGetConfig(void){
+	const sDeviceConfig *cfg = psConfig_Get();
+	uint8_t cnt = 0u;
+	u8TxFrame[cnt++] = (uint8_t)cfg->rs485.baud_rate;
+	u8TxFrame[cnt++] = (uint8_t)cfg->rs485.stop_bits;
+	u8TxFrame[cnt++] = (uint8_t)cfg->rs485.parity;
+	u8TxFrame[cnt++] = (uint8_t)cfg->rs485.protocol;
+	u8TxFrame[cnt++] = (uint8_t)cfg->rs485.log_dir;
+	u8TxFrame[cnt++] = cfg->rs485.params.bytes[0u];
+	u8TxFrame[cnt++] = cfg->rs485.params.bytes[1u];
+	u8TxFrame[cnt++] = cfg->rs485.params.bytes[2u];
+	u8TxFrame[cnt++] = cfg->rs485.params.bytes[3u];
+	u8TxFrame[cnt++] = cfg->rs485.params.bytes[4u];
+	CDC_Transmit_FS(u8TxFrame, CFG_PAYLOAD_SIZE);
+	return true;
+}
+
+static bool ProcessSetConfig(void){
+	sRs485Config rs485;
+	uint8_t cnt = 0u;
+	rs485.baud_rate        = (eBaudRate)     ptrFrameDataStart[cnt++];
+	rs485.stop_bits        = (eStopBits)     ptrFrameDataStart[cnt++];
+	rs485.parity           = (eParity)       ptrFrameDataStart[cnt++];
+	rs485.protocol         = (eRs485Protocol)ptrFrameDataStart[cnt++];
+	rs485.log_dir          = (eLogDirection) ptrFrameDataStart[cnt++];
+	rs485.params.bytes[0u] = ptrFrameDataStart[cnt++];
+	rs485.params.bytes[1u] = ptrFrameDataStart[cnt++];
+	rs485.params.bytes[2u] = ptrFrameDataStart[cnt++];
+	rs485.params.bytes[3u] = ptrFrameDataStart[cnt++];
+	rs485.params.bytes[4u] = ptrFrameDataStart[cnt++];
+	vConfig_SetRs485(&rs485);
+	memcpy(u8TxFrame, "ok", 2);
+	CDC_Transmit_FS(u8TxFrame, 2);
 	return true;
 }
 

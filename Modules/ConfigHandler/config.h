@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 #include "DataTypes.h"
-
+#pragma pack(1)
 /* ── Physical layer enums ────────────────────────────────────────────── */
 
 typedef enum {
@@ -20,6 +20,7 @@ typedef enum {
     ENUM_BAUD_38400,
     ENUM_BAUD_57600,
     ENUM_BAUD_115200,
+	ENUM_BAUD_AUTO_DETECT,
     ENUM_BAUD_COUNT
 } eBaudRate;
 
@@ -42,9 +43,9 @@ typedef enum {
     PROTO_DNP3,             /* 0x05 0x64 sync, block-CRC, DIR bit         */
     PROTO_IEC101,           /* FT1.2 framing, IEC 60870-5-101             */
     PROTO_IEC103,           /* FT1.2 framing, IEC 60870-5-103             */
+    PROTO_RAW,              /* User-configurable delimiters / fixed length */
     PROTO_BACNET_MSTP,      /* 0x55 0xFF preamble, CRC-8 header           */
     PROTO_DMX512,           /* Break + 513 slots at 250 kbaud             */
-    PROTO_RAW,              /* User-configurable delimiters / fixed length */
     PROTO_COUNT
 } eRs485Protocol;
 
